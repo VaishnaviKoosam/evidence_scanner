@@ -13,6 +13,8 @@ flaky LLM call degrades gracefully instead of breaking the pipeline.
 """
 
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import requests
 from dotenv import load_dotenv
@@ -68,8 +70,13 @@ def summarize_evidence_batch(evidence_list: list[Evidence], hypothesis: str) -> 
     than a dataclass field, same reasoning as citation_count -- not
     every piece of evidence in the pipeline necessarily needs one).
     """
-    for ev in evidence_list:
-        ev.summary = summarize_evidence(ev, hypothesis)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {
+            executor.submit(summarize_evidence, ev, hypothesis): ev
+            for ev in evidence_list
+        }
+        for future in as_completed(futures):
+            futures[future].summary = future.result()
     return evidence_list
 
 
@@ -78,18 +85,28 @@ def _call_llm(prompt: str) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY not set")
 
-    resp = requests.post(
-        GROQ_BASE,
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={
-            "model": GROQ_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-        },
-        timeout=20,
-    )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    # Initial attempt plus two retries, only for rate limits/server errors.
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                GROQ_BASE,
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                },
+                timeout=20,
+            )
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            response = exc.response
+            status = response.status_code if response is not None else None
+            if attempt == 2 or status is None or not (status == 429 or 500 <= status < 600):
+                raise
+            time.sleep(2 ** attempt)
+            continue
+        return resp.json()["choices"][0]["message"]["content"]
 
 
 def _fallback_summary(abstract: str) -> str:

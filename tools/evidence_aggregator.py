@@ -1,6 +1,7 @@
 """Collect literature evidence, retrying empty searches with the raw hypothesis."""
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -17,11 +18,20 @@ logger = logging.getLogger(__name__)
 
 
 def _search_queries(queries: list[str], max_results: int) -> list[Evidence]:
-    evidence = []
-    for query in queries:
-        for search in (pubmed_search, europepmc_search, semantic_scholar_search):
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {
+            executor.submit(search, query, max_results=max_results): (index, search)
+            for index, (query, search) in enumerate(
+                (query, search)
+                for query in queries
+                for search in (pubmed_search, europepmc_search, semantic_scholar_search)
+            )
+        }
+        results = [[] for _ in futures]
+        for future in as_completed(futures):
+            index, search = futures[future]
             try:
-                evidence.extend(search(query, max_results=max_results))
+                results[index].extend(future.result())
             except Exception as exc:
                 # A failed source must not discard results or skip other sources.
                 # Never log raw exceptions: request URLs can contain API keys.
@@ -36,7 +46,7 @@ def _search_queries(queries: list[str], max_results: int) -> list[Evidence]:
                     "Evidence source %s failed: %s; continuing",
                     getattr(search, "__name__", type(search).__name__), detail,
                 )
-    return evidence
+    return [item for batch in results for item in batch]
 
 
 def gather_evidence(hypothesis: str, num_queries: int = 3,

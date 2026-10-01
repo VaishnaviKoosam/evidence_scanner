@@ -5,6 +5,8 @@ Patches restore automatically, including when an assertion fails.
 """
 import os
 import sys
+import time
+from threading import Lock
 from contextlib import contextmanager
 from unittest.mock import patch
 
@@ -64,7 +66,7 @@ def test_normal_results():
         assert all(actual is original for actual, original in zip(result["evidence"], evidence))
         assert result["broadened"] is False
         assert result["queries_used"] == QUERIES
-        assert calls == expected_calls(QUERIES)
+        assert sorted(calls) == sorted(expected_calls(QUERIES))
         assert generated == [hypothesis]
     print("test_normal_results PASSED")
 
@@ -79,7 +81,7 @@ def test_zero_initial_results_retry_raw_hypothesis():
         assert result["evidence"] == [evidence]
         assert result["broadened"] is True
         assert result["queries_used"] == [hypothesis]
-        assert calls == expected_calls(QUERIES + [hypothesis])
+        assert sorted(calls) == sorted(expected_calls(QUERIES + [hypothesis]))
         assert generated == [hypothesis]
     print("test_zero_initial_results_retry_raw_hypothesis PASSED")
 
@@ -91,7 +93,7 @@ def test_zero_results_after_retry_stop():
         assert result["evidence"] == []
         assert result["broadened"] is True
         assert result["queries_used"] == [hypothesis]
-        assert calls == expected_calls(QUERIES + [hypothesis])
+        assert sorted(calls) == sorted(expected_calls(QUERIES + [hypothesis]))
         assert generated == [hypothesis]
     print("test_zero_results_after_retry_stop PASSED")
 
@@ -116,7 +118,7 @@ def test_partial_source_failure():
                 assert result["evidence"] == evidence
                 assert result["broadened"] is retry
                 assert result["queries_used"] == ([hypothesis] if retry else QUERIES)
-                assert calls == expected_calls(QUERIES + ([hypothesis] if retry else []))
+                assert sorted(calls) == sorted(expected_calls(QUERIES + ([hypothesis] if retry else [])))
                 assert generated == [hypothesis]
     print("test_partial_source_failure PASSED (all 3 sources, initial and retry)")
 
@@ -141,9 +143,59 @@ def test_failure_diagnostics_do_not_expose_keys():
     print("test_failure_diagnostics_do_not_expose_keys PASSED")
 
 
+
+def test_search_fanout_runs_concurrently_with_independent_failure():
+    queries = ["q0", "q1", "q2"]
+    delays = [0.40, 0.10, 0.20, 0.15, 0.15, 0.15, 0.15, 0.15, 0.15]
+    items = [sample(SOURCE_NAMES[i % 3], f"Paper {i}") for i in range(9)]
+    completed = []
+    active = peak = 0
+    lock = Lock()
+
+    def make_search(source_index):
+        def search(query, max_results):
+            nonlocal active, peak
+            assert max_results == 7
+            index = queries.index(query) * 3 + source_index
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                time.sleep(delays[index])
+                if index == 4:
+                    raise RuntimeError("secret URL must never be logged")
+                return [items[index]]
+            finally:
+                with lock:
+                    active -= 1
+                    completed.append(index)
+        search.__name__ = SOURCE_NAMES[source_index]
+        return search
+
+    with patch.multiple(aggregator, **{
+        name: make_search(i) for i, name in enumerate(SOURCE_NAMES)
+    }), patch.object(aggregator.logger, "warning") as warning:
+        start = time.perf_counter()
+        result = aggregator._search_queries(queries, max_results=7)
+        elapsed = time.perf_counter() - start
+    expected = [item for i, item in enumerate(items) if i != 4]
+    assert result == expected
+    assert all(actual is original for actual, original in zip(result, expected))
+    assert sorted(completed) == list(range(9))
+    assert completed[0] != 0
+    assert 1 < peak <= 5
+    assert elapsed < sum(delays) * 0.7, (elapsed, sum(delays))
+    warning.assert_called_once_with(
+        "Evidence source %s failed: %s; continuing", "europepmc_search", "RuntimeError"
+    )
+    print(f"test_search_fanout_runs_concurrently_with_independent_failure PASSED "
+          f"({elapsed:.2f}s vs {sum(delays):.2f}s sequential; peak {peak} workers)")
+
+
 if __name__ == "__main__":
     # Fail closed if a future edit accidentally bypasses the mocked functions.
     with patch("socket.socket", side_effect=AssertionError("Network forbidden in offline tests")) as network:
+        test_search_fanout_runs_concurrently_with_independent_failure()
         test_normal_results()
         test_zero_initial_results_retry_raw_hypothesis()
         test_zero_results_after_retry_stop()
