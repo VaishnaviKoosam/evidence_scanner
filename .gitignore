@@ -1,0 +1,8 @@
+# Never commit your real .env file -- it has your actual API keys in it.
+.env
+
+# Standard Python clutter
+__pycache__/
+*.pyc
+.venv/
+venv/
