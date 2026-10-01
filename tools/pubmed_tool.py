@@ -12,12 +12,17 @@ No API key required, but rate limits are 3 req/sec without a key,
 
 import os
 import time
+import threading
 import requests
 from dataclasses import dataclass, field
 from typing import Optional
 
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 NCBI_API_KEY = os.environ.get("NCBI_API_KEY")  # optional, raises rate limit
+
+# Reentrant so request dispatch can hold the same lock as the delay helper.
+_pubmed_lock = threading.RLock()
+_last_call_time = [0.0]
 
 
 @dataclass
@@ -40,8 +45,37 @@ class Evidence:
 
 
 def _rate_limit_delay():
-    # Stay comfortably under NCBI's limits.
-    time.sleep(0.34 if not NCBI_API_KEY else 0.11)
+    # All E-utilities endpoints and retries share this process-wide limiter.
+    interval = 0.11 if NCBI_API_KEY else 0.34
+    with _pubmed_lock:
+        wait = _last_call_time[0] + interval - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        _last_call_time[0] = time.monotonic()
+
+
+def _pubmed_get(url: str, params: dict, timeout: int):
+    """Throttle each HTTP attempt; retry only 429, at most twice."""
+    for attempt in range(3):
+        try:
+            # Hold the lock through dispatch so a descheduled thread cannot
+            # send its request after another thread has acquired the next slot.
+            with _pubmed_lock:
+                _rate_limit_delay()
+                try:
+                    response = requests.get(url, params=params, timeout=timeout)
+                finally:
+                    # Conservative spacing from the end of the previous request
+                    # also guarantees spacing between actual request starts.
+                    _last_call_time[0] = time.monotonic()
+            response.raise_for_status()
+            return response
+        except requests.HTTPError as exc:
+            response = exc.response
+            if attempt == 2 or response is None or response.status_code != 429:
+                raise
+            # Release the limiter lock during backoff.
+            time.sleep(2 ** attempt)
 
 
 def pubmed_search(query: str, max_results: int = 8, filters: Optional[dict] = None) -> list[Evidence]:
@@ -74,14 +108,12 @@ def pubmed_search(query: str, max_results: int = 8, filters: Optional[dict] = No
     if NCBI_API_KEY:
         params["api_key"] = NCBI_API_KEY
 
-    resp = requests.get(f"{EUTILS_BASE}/esearch.fcgi", params=params, timeout=15)
-    resp.raise_for_status()
+    resp = _pubmed_get(f"{EUTILS_BASE}/esearch.fcgi", params=params, timeout=15)
     id_list = resp.json().get("esearchresult", {}).get("idlist", [])
 
     if not id_list:
         return []
 
-    _rate_limit_delay()
     return _fetch_details(id_list)
 
 
@@ -105,8 +137,7 @@ def _fetch_details(pmids: list[str]) -> list[Evidence]:
     if NCBI_API_KEY:
         params["api_key"] = NCBI_API_KEY
 
-    resp = requests.get(f"{EUTILS_BASE}/efetch.fcgi", params=params, timeout=20)
-    resp.raise_for_status()
+    resp = _pubmed_get(f"{EUTILS_BASE}/efetch.fcgi", params=params, timeout=20)
     return _parse_efetch_xml(resp.text)
 
 

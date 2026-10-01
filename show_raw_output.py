@@ -1,5 +1,5 @@
 """
-show_raw_output_multi.py -- prints the EXACT, full, untruncated
+show_raw_output.py -- prints the EXACT, full, untruncated
 ScannerResult dict for several hypotheses in a row. This is exactly
 what gets handed to the Fusion Agent each time -- nothing truncated,
 nothing prettified.

@@ -1,4 +1,4 @@
-﻿# Evidence Scanner integration contract
+# Evidence Scanner integration contract
 
 Verified against the source and project .venv on 2026-09-29.
 Python in this environment: 3.13.2. The pinned direct dependencies require Python >=3.10.

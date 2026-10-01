@@ -1,4 +1,4 @@
-﻿# LangGraph Evidence-Based Scanner
+# LangGraph Evidence-Based Scanner
 
 Install dependencies from this directory:
 
